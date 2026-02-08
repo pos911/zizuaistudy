@@ -1,0 +1,43 @@
+name: Daily News Analysis
+
+on:
+  schedule:
+    # 한국 시간(KST) 기준: 07:00, 10:00, 13:00, 16:00, 19:00 (3시간 간격)
+    # UTC 기준: 22:00(전날), 01:00, 04:00, 07:00, 10:00
+    - cron: '0 22,1,4,7,10 * * *'
+  
+  workflow_dispatch: # 수동 실행 가능
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install requests python-dotenv google-genai
+
+      - name: Run News Analysis
+        env:
+          ENV_JSON: ${{ secrets.ENV_JSON }}
+        run: python main.py
+
+      - name: Commit and Push changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add news.db
+          git commit -m "Update news database [skip ci]" || echo "No changes to commit"
+          git push
