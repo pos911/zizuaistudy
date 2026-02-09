@@ -4,37 +4,20 @@ import sqlite3
 import requests
 import time
 from google import genai
+from google.genai import types
 from google.genai.errors import ClientError
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-# 로컬 환경 변수 로드 (.env 파일이 있을 경우)
+# 로컬 환경 변수 로드
 load_dotenv()
 
-def get_env():
-    """GitHub Secrets(JSON) 또는 로컬 환경 변수에서 설정값 로드"""
-    env_json = os.getenv("ENV_JSON")
-    if env_json:
-        try:
-            return json.loads(env_json)
-        except Exception as e:
-            print(f"![오류] ENV_JSON 파싱 실패: {e}")
-    
-    return {
-        "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY"),
-        "NAVER_CLIENT_ID": os.getenv("NAVER_CLIENT_ID"),
-        "NAVER_CLIENT_SECRET": os.getenv("NAVER_CLIENT_SECRET"),
-        "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN"),
-        "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID")
-    }
-
 # 설정값 할당
-config = get_env()
-client = genai.Client(api_key=config.get("GEMINI_API_KEY"))
-NAVER_ID = config.get("NAVER_CLIENT_ID")
-NAVER_SECRET = config.get("NAVER_CLIENT_SECRET")
-TG_TOKEN = config.get("TELEGRAM_TOKEN")
-TG_CHAT_ID = config.get("TELEGRAM_CHAT_ID")
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+NAVER_ID = os.getenv("NAVER_CLIENT_ID")
+NAVER_SECRET = os.getenv("NAVER_CLIENT_SECRET")
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "news.db"
 
 def init_db():
@@ -51,65 +34,93 @@ def init_db():
     conn.close()
 
 def get_naver_news(query):
-    """네이버 뉴스 검색 (필터링을 고려하여 20건 검색)"""
+    """네이버 뉴스 검색 (20건)"""
     url = f"https://openapi.naver.com/v1/search/news.json?query={query}&display=20&sort=date"
     headers = {"X-Naver-Client-Id": NAVER_ID, "X-Naver-Client-Secret": NAVER_SECRET}
-    res = requests.get(url, headers=headers)
-    return res.json().get('items', []) if res.status_code == 200 else []
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        return res.json().get('items', []) if res.status_code == 200 else []
+    except Exception as e:
+        print(f"![오류] 네이버 뉴스 검색 실패: {e}")
+        return []
 
 def analyze_batch_filtered(news_list):
     """
-    [핵심 수정] 기업 브랜딩/리스크 뉴스 선별 분석
+    [핵심 수정] JSON 구조화된 응답을 요청하여 인덱스 밀림 방지 및 품질 향상
     """
     if not news_list:
         return []
 
-    combined_text = ""
-    for idx, news in enumerate(news_list, 1):
-        combined_text += f"[{idx}] 제목: {news['title']}\n내용: {news['desc']}\n\n"
+    # 프롬프트에 전달할 뉴스 목록 구성 (ID 포함)
+    news_content = json.dumps([
+        {"id": news['id'], "title": news['title'], "description": news['desc']} 
+        for news in news_list
+    ], ensure_ascii=False, indent=2)
 
     prompt = f"""
-    당신은 기업 평판 리스크 관리 전문가입니다. 
-    다음 {len(news_list)}개의 뉴스를 분석하여 '한국투자증권' 기업 자체의 이슈만 선별하세요.
+    당신은 '기업 평판 리스크 관리 전문가'입니다.
+    주어지는 뉴스 목록을 분석하여, '한국투자증권' 기업 자체의 리스크나 브랜딩에 관련된 중요 뉴스만 선별하세요.
 
-    [절대 규칙]
-    1. '한국투자증권'이 단순히 주식 종목을 분석하거나 목표주가를 제시한 리포트 기사는 무조건 "PASS"라고만 출력하세요.
-    2. 선별된 기사는 반드시 아래 포맷만 출력하세요. (잡다한 설명 금지)
-       [감성] | 요약문
-    3. 감성은 [긍정], [부정], [중립] 중 하나만 사용하세요.
-    4. 각 뉴스 결과 사이에는 반드시 '###' 구분자를 넣어주세요.
+    [분석 규칙]
+    1. **PASS 처리 대상 (엄격히 적용)**:
+       - 단순 주식 시황, 목표주가 변동(상향/하향/유지), 투자의견(Buy/Hold) 리포트
+       - 단순 실적 공시 나열, 특징주 언급, 종목 추천 기사
+    2. **KEEP 처리 대상**:
+       - 기업 경영 이슈, 사고, 법적 분쟁, 새로운 서비스 출시, CEO 동정, 대규모 투자/제휴 등 기업 실체와 관련된 뉴스
+    3. **출력 형식 (JSON)**:
+       - 반드시 아래 JSON 스키마를 따르는 리스트만 출력하세요. 다른 말은 절대 금지합니다.
+       - status는 "KEEP" 또는 "PASS" 중 하나여야 합니다.
+       - sentiment는 "긍정", "부정", "중립" 중 하나여야 합니다. KEEP인 경우 필수로 작성하고, PASS인 경우 비워두거나 무시합니다.
+       - 감성은 기업 입장에서의 유불리를 따지세요.
+       
+    [JSON Schema]
+    [
+      {{
+        "id": <뉴스ID (정수)>,
+        "status": "KEEP" or "PASS",
+        "sentiment": "<감성>",
+        "summary": "<한 줄 핵심 요약>"
+      }},
+      ...
+    ]
 
-    뉴스 목록:
-    {combined_text}
+    [분석할 뉴스 목록]
+    {news_content}
     """
 
     for attempt in range(3): # 최대 3회 재시도
         try:
-            response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
-            results = response.text.split('###')
+            response = client.models.generate_content(
+                model='gemini-2.0-flash', 
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json" # JSON 응답 강제
+                )
+            )
             
-            # 개수 보정 (응답 개수가 안 맞을 경우 대비)
-            if len(results) < len(news_list):
-                results.extend(["PASS"] * (len(news_list) - len(results)))
-                
-            return [res.strip() for res in results]
+            # JSON 파싱
+            return json.loads(response.text)
+
         except ClientError as e:
-            if e.code == 429: # Resource Exhausted
+            if e.code == 429:
                 print(f"⏳ Quota exceeded (Attempt {attempt+1}/3). Waiting 60s...")
                 time.sleep(60)
                 continue
             print(f"![오류] API 클라이언트 에러: {e}")
-            break # 429 외의 에러는 재시도하지 않음
+            break
+        except json.JSONDecodeError:
+            print(f"![오류] JSON 파싱 실패. 응답이 올바르지 않습니다.")
+            # 파싱 실패 시 재시도 할 수도 있지만, 여기서는 생략
+            break
         except Exception as e:
             print(f"![오류] 통합 분석 중 에러: {e}")
-            # 일반적인 에러는 재시도 없이 종료 (필요 시 정책 변경 가능)
             break
             
-    return ["PASS"] * len(news_list)
+    return [] # 실패 시 빈 리스트 반환
 
 def main():
     init_db()
-    print("[*] 한국투자증권 뉴스 필터링 시스템 가동 (Strict Mode)")
+    print("[*] 한국투자증권 뉴스 필터링 시스템 가동 (JSON Mode)")
     
     items = get_naver_news("한국투자증권")
     
@@ -117,86 +128,85 @@ def main():
     cursor = conn.cursor()
     
     new_to_analyze = []
-    final_messages = []
     
-    # 1차: 파이썬 키워드 필터 (리포트 용어)
-    # 제목에 이 단어가 있으면 API 호출조차 하지 않음 (비용 0원)
-    EXCLUDE_KEYWORDS = ['목표주가', '목표가', '투자의견', '상향', '하향', '유지', '매수', '매도', 'Buy', 'Hold', 'Target Price']
+    # 1. 파이썬 레벨 키워드 필터링 (비용 절감)
+    EXCLUDE_KEYWORDS = ['목표주가', '목표가', '투자의견', '상향', '하향', '유지', '매수', '매도', 'Buy', 'Hold', 'Target Price', '특징주']
 
-    for item in items:
+    for idx, item in enumerate(items):
         title = item['title'].replace('<b>', '').replace('</b>', '').replace('&quot;', '"')
-        desc = item['description'].replace('<b>', '').replace('</b>', '')
+        desc = item['description'].replace('<b>', '').replace('</b>', '').replace('&quot;', '"')
         
+        # 중복 확인
         cursor.execute("SELECT title FROM news WHERE title=?", (title,))
         if cursor.fetchone():
             continue
 
+        # 키워드 필터링
         if any(keyword in title for keyword in EXCLUDE_KEYWORDS):
             print(f"[1차 필터] 제외됨(제목 키워드): {title}")
             continue
 
+        # 분석 대상에 추가 (ID 부여)
         new_to_analyze.append({
+            'id': idx,
             'title': title,
             'link': item['link'],
             'desc': desc,
             'pubDate': item['pubDate']
         })
 
-    # 2차: AI 분석 및 결과 처리
+    # 2. AI 배치 분석
     if new_to_analyze:
-        print(f"[*] {len(new_to_analyze)}건 분석 시작...")
+        print(f"[*] {len(new_to_analyze)}건 AI 분석 요청...")
         analysis_results = analyze_batch_filtered(new_to_analyze)
+        
+        # 분석 결과 매핑을 위한 딕셔너리 생성
+        result_map = {res['id']: res for res in analysis_results if 'id' in res and 'status' in res}
+        
+        final_messages = []
         today_str = datetime.now().strftime('%Y-%m-%d')
         
-        for i, news in enumerate(new_to_analyze):
-            if i >= len(analysis_results): break
+        for news in new_to_analyze:
+            res = result_map.get(news['id'])
             
-            raw_result = analysis_results[i].strip()
-            
-            # ------------------------------------------------------------------
-            # [수정된 핵심 로직] PASS가 포함되면 무조건 삭제 (대소문자 무시)
-            # "제외할 기사: PASS", "[PASS]" 등 어떤 형태든 PASS가 들어가면 다 죽임
-            # ------------------------------------------------------------------
-            if "PASS" in raw_result.upper():
-                print(f"[2차 필터] AI 제외(PASS): {news['title']}")
+            # 결과가 없거나 PASS인 경우 저장 안 함
+            if not res or res.get('status') != 'KEEP':
+                reason = "AI PASS" if res else "분석 실패/누락"
+                print(f"[2차 필터] {reason}: {news['title']}")
                 continue
             
-            # 안전장치: 혹시 PASS를 안 썼는데 내용이 리포트인 경우 한번 더 거름
-            if any(bad in raw_result for bad in EXCLUDE_KEYWORDS):
-                print(f"[2차 필터] 내용 부적절: {news['title']}")
-                continue
-
-            # 포맷 클리닝 (잡다한 접두어 제거)
-            clean_result = raw_result.replace("- 선별된 기사:", "").replace("선별된 기사:", "").strip()
+            # KEEP인 경우 저장 및 전송
+            sentiment = res.get('sentiment', '중립')
+            summary = res.get('summary', '요약 없음')
             
-            # 파싱
-            if "|" in clean_result:
-                parts = clean_result.split('|', 1)
-                sentiment = parts[0].strip()
-                summary = parts[1].strip()
-            else:
-                # 형식이 깨졌지만 유효한 내용인 경우
-                sentiment = "🔔알림" 
-                summary = clean_result
+            # 감성 이모지 추가
+            if "긍정" in sentiment: sentiment_display = "👍긍정"
+            elif "부정" in sentiment: sentiment_display = "👎부정"
+            else: sentiment_display = "⚖️중립"
 
-            # DB 저장
+            print(f"[저장] {sentiment_display} | {news['title']}")
+
             cursor.execute("INSERT INTO news (title, link, description, pubDate, summary, sentiment, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", 
-                           (news['title'], news['link'], news['desc'], news['pubDate'], summary, sentiment, today_str))
+                           (news['title'], news['link'], news['desc'], news['pubDate'], summary, sentiment_display, today_str))
             
-            # 메시지 포맷
-            final_messages.append(f"{sentiment} <b>{news['title']}</b>\n{summary}\n<a href='{news['link']}'>🔗 기사보기</a>")
-
+            final_messages.append(f"{sentiment_display} <b>{news['title']}</b>\n{summary}\n<a href='{news['link']}'>🔗 기사보기</a>")
+        
         conn.commit()
         
+        # 텔레그램 전송
         if final_messages:
             message = f"<b>[한국투자증권 기업 주요 뉴스]</b>\n\n" + "\n\n".join(final_messages)
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", 
-                          json={"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True})
-            print(f"[*] {len(final_messages)}건 전송 완료.")
+            try:
+                requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", 
+                              json={"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=10)
+                print(f"[*] {len(final_messages)}건 전송 완료.")
+            except Exception as e:
+                print(f"![전송 오류] {e}")
         else:
             print("[*] 전송할 뉴스가 없습니다 (모두 필터링됨).")
+            
     else:
-        print("[*] 신규 뉴스가 없습니다.")
+        print("[*] 신규 분석 대상 뉴스가 없습니다.")
 
     conn.close()
 
