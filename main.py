@@ -4,6 +4,7 @@ import sqlite3
 import requests
 import time
 from google import genai
+from google.genai.errors import ClientError
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -82,18 +83,29 @@ def analyze_batch_filtered(news_list):
     {combined_text}
     """
 
-    try:
-        response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
-        results = response.text.split('###')
-        
-        # 개수 보정 (응답 개수가 안 맞을 경우 대비)
-        if len(results) < len(news_list):
-            results.extend(["PASS"] * (len(news_list) - len(results)))
+    for attempt in range(3): # 최대 3회 재시도
+        try:
+            response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+            results = response.text.split('###')
             
-        return [res.strip() for res in results]
-    except Exception as e:
-        print(f"![오류] 통합 분석 중 에러: {e}")
-        return ["PASS"] * len(news_list)
+            # 개수 보정 (응답 개수가 안 맞을 경우 대비)
+            if len(results) < len(news_list):
+                results.extend(["PASS"] * (len(news_list) - len(results)))
+                
+            return [res.strip() for res in results]
+        except ClientError as e:
+            if e.code == 429: # Resource Exhausted
+                print(f"⏳ Quota exceeded (Attempt {attempt+1}/3). Waiting 60s...")
+                time.sleep(60)
+                continue
+            print(f"![오류] API 클라이언트 에러: {e}")
+            break # 429 외의 에러는 재시도하지 않음
+        except Exception as e:
+            print(f"![오류] 통합 분석 중 에러: {e}")
+            # 일반적인 에러는 재시도 없이 종료 (필요 시 정책 변경 가능)
+            break
+            
+    return ["PASS"] * len(news_list)
 
 def main():
     init_db()
