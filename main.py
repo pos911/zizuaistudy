@@ -12,29 +12,52 @@ from dotenv import load_dotenv
 # 로컬 환경 변수 로드
 load_dotenv()
 
-def get_env(key):
-    """환경변수를 가져오되, 없으면 에러를 발생시킴"""
-    value = os.getenv(key)
-    if value is None:
-        print(f"![CRITICAL] 환경변수 누락: {key}")
-        return None
-    return value
+def load_config():
+    """
+    환경설정 로드 우선순위:
+    1. ENV_JSON (GitHub Actions Secret)
+    2. .env / os.environ (Local Dev)
+    """
+    env_json = os.getenv("ENV_JSON")
+    config = {}
 
-# 필수 환경변수 검증 및 로드
-REQUIRED_VARS = ["GEMINI_API_KEY", "NAVER_CLIENT_ID", "NAVER_CLIENT_SECRET", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"]
-missing_vars = [key for key in REQUIRED_VARS if os.getenv(key) is None]
+    # 1. ENV_JSON 파싱
+    if env_json:
+        try:
+            print("[*] ENV_JSON 감지됨 via GitHub Secrets. 설정 로드 중...")
+            config = json.loads(env_json)
+        except json.JSONDecodeError:
+            print("![CRITICAL] ENV_JSON 파싱 실패. JSON 형식을 확인하세요.")
+            import sys
+            sys.exit(1)
+    
+    # 2. 누락된 값은 os.environ에서 보충 (로컬 개발용)
+    REQUIRED_VARS = ["GEMINI_API_KEY", "NAVER_CLIENT_ID", "NAVER_CLIENT_SECRET", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"]
+    for key in REQUIRED_VARS:
+        if key not in config:
+            val = os.getenv(key)
+            if val:
+                config[key] = val
+    
+    # 3. 필수 변수 검증
+    missing_vars = [key for key in REQUIRED_VARS if not config.get(key)]
+    if missing_vars:
+        print(f"![CRITICAL] 필수 환경변수 누락: {', '.join(missing_vars)}")
+        print("TIP: GitHub Secrets의 ENV_JSON 또는 .env 파일을 확인하세요.")
+        import sys
+        sys.exit(1)
 
-if missing_vars:
-    print(f"![CRITICAL] 필수 환경변수가 누락되었습니다: {', '.join(missing_vars)}")
-    import sys
-    sys.exit(1)
+    return config
+
+# 설정 로드
+config = load_config()
 
 # 설정값 할당
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-NAVER_ID = os.getenv("NAVER_CLIENT_ID")
-NAVER_SECRET = os.getenv("NAVER_CLIENT_SECRET")
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+client = genai.Client(api_key=config.get("GEMINI_API_KEY"))
+NAVER_ID = config.get("NAVER_CLIENT_ID")
+NAVER_SECRET = config.get("NAVER_CLIENT_SECRET")
+TG_TOKEN = config.get("TELEGRAM_TOKEN")
+TG_CHAT_ID = config.get("TELEGRAM_CHAT_ID")
 DB_PATH = "news.db"
 
 def init_db():
@@ -115,8 +138,16 @@ def analyze_batch_filtered(news_list):
                 )
             )
             
-            # JSON 파싱
-            return json.loads(response.text)
+            # JSON 파싱 (Markdown 코드 블록 제거)
+            text = response.text.strip()
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.startswith("```"):
+                text = text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            
+            return json.loads(text.strip())
 
         except ClientError as e:
             if e.code == 429:
@@ -178,7 +209,10 @@ def main():
         analysis_results = analyze_batch_filtered(new_to_analyze)
         
         # 분석 결과 매핑을 위한 딕셔너리 생성
-        result_map = {res['id']: res for res in analysis_results if 'id' in res and 'status' in res}
+        if not isinstance(analysis_results, list):
+            analysis_results = []
+            
+        result_map = {res['id']: res for res in analysis_results if isinstance(res, dict) and 'id' in res and 'status' in res}
         
         final_messages = []
         today_str = datetime.now().strftime('%Y-%m-%d')
