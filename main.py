@@ -12,6 +12,23 @@ from dotenv import load_dotenv
 # 로컬 환경 변수 로드
 load_dotenv()
 
+def get_env(key):
+    """환경변수를 가져오되, 없으면 에러를 발생시킴"""
+    value = os.getenv(key)
+    if value is None:
+        print(f"![CRITICAL] 환경변수 누락: {key}")
+        return None
+    return value
+
+# 필수 환경변수 검증 및 로드
+REQUIRED_VARS = ["GEMINI_API_KEY", "NAVER_CLIENT_ID", "NAVER_CLIENT_SECRET", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"]
+missing_vars = [key for key in REQUIRED_VARS if os.getenv(key) is None]
+
+if missing_vars:
+    print(f"![CRITICAL] 필수 환경변수가 누락되었습니다: {', '.join(missing_vars)}")
+    import sys
+    sys.exit(1)
+
 # 설정값 할당
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 NAVER_ID = os.getenv("NAVER_CLIENT_ID")
